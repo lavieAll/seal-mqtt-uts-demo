@@ -1,0 +1,581 @@
+<template>
+	<scroll-view class="page" direction="vertical">
+		<!-- 平台 / 状态 -->
+		<view class="card">
+			<view class="kv">
+				<text class="k">平台：</text>
+				<text class="v">{{ platform }}　状态：</text>
+				<text class="v" :class="stateLabel == 'connected' ? 'st-ok' : 'st-no'">{{ stateLabel }}</text>
+			</view>
+			<text class="caps">schemes: {{ capsText }}</text>
+		</view>
+
+		<!-- 1. 连接 -->
+		<view class="card">
+			<text class="h">1. 连接配置</text>
+			<view class="seg">
+				<button size="mini" @click="setPreset('tcp')">TCP</button>
+				<button size="mini" @click="setPreset('ws')">WS</button>
+				<button size="mini" @click="setPreset('tls')">TLS</button>
+				<button size="mini" @click="setPreset('wss')">WSS</button>
+			</view>
+			<input class="inp" v-model="url" placeholder="mqtt://host:1883" />
+			<input class="inp" v-model="clientId" placeholder="clientId（留空自动生成）" />
+			<input class="inp" v-model="username" placeholder="username（可选）" />
+			<input class="inp" v-model="password" password placeholder="password（可选）" />
+			<view class="kv">
+				<text class="v">clean session</text>
+				<switch :checked="clean" @change="clean = $event.detail.value" />
+				<text class="v">MQTT5.0</text>
+				<switch :checked="proto5" @change="proto5 = $event.detail.value" />
+			</view>
+			<view class="seg">
+				<button type="primary" size="mini" @click="doConnect">连接</button>
+				<button size="mini" @click="doDisconnect">断开</button>
+				<button type="warn" size="mini" @click="startAutoTest">自动测试</button>
+			</view>
+		</view>
+
+		<!-- 2. 订阅 -->
+		<view class="card">
+			<text class="h">2. 订阅（QoS）</text>
+			<input class="inp" v-model="subTopic" placeholder="订阅 topic，如 seal/test/#" />
+			<view class="seg">
+				<button size="mini" :type="subQos == 0 ? 'primary' : 'default'" @click="subQos = 0">QoS0</button>
+				<button size="mini" :type="subQos == 1 ? 'primary' : 'default'" @click="subQos = 1">QoS1</button>
+				<button size="mini" :type="subQos == 2 ? 'primary' : 'default'" @click="subQos = 2">QoS2</button>
+				<button type="primary" size="mini" @click="doSubscribe">订阅</button>
+			</view>
+			<view v-for="(item, idx) in subs" :key="item.topic" class="rowline">
+				<text class="grow">{{ item.topic }}（QoS{{ item.qos }}）</text>
+				<button size="mini" @click="doUnsubscribe(item.topic)">取消</button>
+			</view>
+		</view>
+
+		<!-- 3. 发布 -->
+		<view class="card">
+			<text class="h">3. 发布</text>
+			<input class="inp" v-model="pubTopic" placeholder="发布 topic（不支持通配符）" />
+			<input class="inp" v-model="pubPayload" placeholder="消息内容（文本）" />
+			<view class="kv">
+				<text class="v">QoS</text>
+				<button size="mini" :type="pubQos == 0 ? 'primary' : 'default'" @click="pubQos = 0">0</button>
+				<button size="mini" :type="pubQos == 1 ? 'primary' : 'default'" @click="pubQos = 1">1</button>
+				<button size="mini" :type="pubQos == 2 ? 'primary' : 'default'" @click="pubQos = 2">2</button>
+				<text class="v">retain</text>
+				<switch :checked="pubRetain" @change="pubRetain = $event.detail.value" />
+			</view>
+			<button type="primary" size="mini" @click="doPublish">发布</button>
+		</view>
+
+		<!-- 4. 消息 -->
+		<view class="card">
+			<text class="h">4. 收到消息（{{ messages.length }}）</text>
+			<view v-for="(item, idx) in messages" :key="item.id" class="msgline">
+				<text class="msgmeta">{{ item.time }} [Q{{ item.qos }}]{{ item.retain ? ' R' : '' }} {{ item.topic }}</text>
+				<text class="msgbody">{{ item.payload }}</text>
+			</view>
+		</view>
+
+		<!-- 5. 自动测试结果 -->
+		<view class="card">
+			<text class="h">5. 自动测试结果</text>
+			<view v-for="(item, idx) in testResults" :key="item.name" class="rowline">
+				<text :class="item.ok ? 'st-ok' : 'st-no'">{{ item.ok ? 'PASS' : 'FAIL' }}</text>
+				<text class="grow">{{ item.name }}</text>
+				<text class="detail">{{ item.detail }}</text>
+			</view>
+		</view>
+
+		<!-- 6. 事件日志 -->
+		<view class="card">
+			<text class="h">6. 事件日志</text>
+			<view v-for="(item, idx) in logs" :key="item.id" class="logline">
+				<text class="logmeta">{{ item.time }} [{{ item.level }}]</text>
+				<text class="logtext">{{ item.text }}</text>
+			</view>
+		</view>
+	</scroll-view>
+</template>
+
+<script setup lang="uts">
+	import { createMqttClient, getMqttCapabilities } from '@/uni_modules/seal-mqtt-uts'
+	import { MqttQos } from '@/uni_modules/seal-mqtt-uts'
+
+	// ============ 列表条目类型 ============
+	type MsgItem = { id: number, time: string, topic: string, payload: string, qos: number, retain: boolean }
+	type LogItem = { id: number, time: string, level: string, text: string }
+	type TestItem = { name: string, ok: boolean, detail: string }
+	type SubItem = { topic: string, qos: number }
+	type EchoExpect = { topic: string, payload: string, useBase64: boolean, name: string }
+
+	// ============ 平台标识 ============
+	let platform = '?'
+	// #ifdef APP-IOS
+	platform = 'iOS'
+	// #endif
+	// #ifdef APP-ANDROID
+	platform = 'Android'
+	// #endif
+	// #ifdef APP-HARMONY
+	platform = 'Harmony'
+	// #endif
+	// #ifdef MP-WEIXIN
+	platform = '微信小程序'
+	// #endif
+	// #ifdef MP-ALIPAY
+	platform = '支付宝小程序'
+	// #endif
+	// #ifdef WEB
+	platform = 'Web'
+	// #endif
+
+	const caps = getMqttCapabilities()
+	let capsText = ''
+	for (let i = 0; i < caps.schemes.length; i++) {
+		capsText += caps.schemes[i] + ' '
+	}
+
+	// 自动测试 broker：App/鸿蒙优先 TCP，JS 端（web/小程序）用 WS
+	function pickAutoUrl(): string {
+		if (caps.schemes.indexOf('mqtt') >= 0) return 'mqtt://broker.emqx.io:1883'
+		if (caps.schemes.indexOf('ws') >= 0) return 'ws://broker.emqx.io:8083/mqtt'
+		return ''
+	}
+	const autoUrl = pickAutoUrl()
+	const autoConnectLabel = autoUrl.startsWith('mqtt') ? 'TCP 连接 broker.emqx.io' : 'WS 连接 broker.emqx.io'
+
+	// ============ 响应式状态 ============
+	const stateLabel = ref<string>('idle')
+	const url = ref<string>('mqtt://broker.emqx.io:1883')
+	const clientId = ref<string>('')
+	const username = ref<string>('')
+	const password = ref<string>('')
+	const clean = ref<boolean>(true)
+	const proto5 = ref<boolean>(false)
+
+	const subTopic = ref<string>('seal/test/' + Date.now())
+	const subQos = ref<number>(1)
+	const subs = ref<Array<SubItem>>([])
+
+	const pubTopic = ref<string>('seal/test/' + Date.now())
+	const pubPayload = ref<string>('hello seal-mqtt-uts')
+	const pubQos = ref<number>(0)
+	const pubRetain = ref<boolean>(false)
+
+	const messages = ref<Array<MsgItem>>([])
+	const logs = ref<Array<LogItem>>([])
+	const testResults = ref<Array<TestItem>>([])
+
+	let seq = 0
+	function nextId(): number { seq += 1; return seq }
+
+	function nowTime(): string {
+		const d = new Date()
+		const pad = (n: number): string => n < 10 ? '0' + n : '' + n
+		return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) +
+			'.' + Math.floor(d.getMilliseconds() / 100)
+	}
+
+	function addLog(level: string, text: string): void {
+		logs.value.unshift({ id: nextId(), time: nowTime(), level, text })
+		if (logs.value.length > 100) logs.value.pop()
+	}
+
+	// ============ 手动测试客户端 ============
+	const client = createMqttClient()
+
+	client.onConnect((res) => {
+		stateLabel.value = 'connected'
+		addLog('onConnect', 'sessionPresent=' + res.sessionPresent + ' v' + res.protocolVersion)
+	})
+	client.onMessage((msg) => {
+		messages.value.unshift({
+			id: nextId(), time: nowTime(), topic: msg.topic,
+			payload: msg.payload, qos: msg.qos, retain: msg.retain
+		})
+		if (messages.value.length > 100) messages.value.pop()
+		addLog('onMessage', '[' + msg.qos + '] ' + msg.topic + ' : ' + msg.payload)
+	})
+	client.onReconnecting((info) => {
+		stateLabel.value = 'reconnecting'
+		addLog('onReconnecting', 'attempt=' + info.attempt + ' delay=' + info.delay + 'ms')
+	})
+	client.onDisconnect((info) => {
+		stateLabel.value = client.getState()
+		addLog('onDisconnect', info.reason + ' willReconnect=' + info.willReconnect)
+	})
+	client.onError((err) => {
+		addLog('onError', err.errCode + ' ' + err.errMsg)
+	})
+
+	function setPreset(name: string): void {
+		if (name == 'tcp') url.value = 'mqtt://broker.emqx.io:1883'
+		else if (name == 'ws') url.value = 'ws://broker.emqx.io:8083/mqtt'
+		else if (name == 'tls') url.value = 'mqtts://broker.emqx.io:8883'
+		else url.value = 'wss://broker.emqx.io:8084/mqtt'
+	}
+
+	function doConnect(): void {
+		addLog('info', 'connect → ' + url.value)
+		client.connect({
+			url: url.value,
+			clientId: clientId.value.length > 0 ? clientId.value : undefined,
+			username: username.value.length > 0 ? username.value : undefined,
+			password: password.value.length > 0 ? password.value : undefined,
+			protocolVersion: proto5.value ? 5 : 4,
+			clean: clean.value,
+			success: (_res) => { addLog('success', 'connect 成功') },
+			fail: (err) => {
+				stateLabel.value = client.getState()
+				addLog('fail', 'connect 失败 ' + err.errCode + ' ' + err.errMsg)
+			},
+			complete: (_r) => {}
+		})
+		stateLabel.value = client.getState()
+	}
+
+	function doDisconnect(): void {
+		addLog('info', 'disconnect')
+		client.disconnect({
+			success: () => { addLog('success', 'disconnect 成功') },
+			fail: (err) => { addLog('fail', 'disconnect 失败 ' + err.errCode) },
+			complete: (_r) => {}
+		})
+		stateLabel.value = client.getState()
+	}
+
+	function doSubscribe(): void {
+		if (subTopic.value.length == 0) { addLog('warn', '订阅 topic 为空'); return }
+		const qos = subQos.value as MqttQos
+		client.subscribe({
+			subscriptions: [{ topic: subTopic.value, qos }],
+			success: (res) => {
+				let granted = ''
+				for (let i = 0; i < res.grantedQos.length; i++) {
+					granted += res.grantedQos[i] + ' '
+				}
+				addLog('success', 'subscribe 成功 granted=' + granted)
+				const idx = subs.value.findIndex((it) => it.topic == subTopic.value)
+				if (idx < 0) subs.value.push({ topic: subTopic.value, qos: subQos.value })
+			},
+			fail: (err) => { addLog('fail', 'subscribe 失败 ' + err.errCode + ' ' + err.errMsg) },
+			complete: (_r) => {}
+		})
+	}
+
+	function doUnsubscribe(topic: string): void {
+		client.unsubscribe({
+			topics: [topic],
+			success: () => {
+				const idx = subs.value.findIndex((it) => it.topic == topic)
+				if (idx >= 0) subs.value.splice(idx, 1)
+				addLog('success', 'unsubscribe ' + topic)
+			},
+			fail: (err) => { addLog('fail', 'unsubscribe 失败 ' + err.errCode) },
+			complete: (_r) => {}
+		})
+	}
+
+	function doPublish(): void {
+		if (pubTopic.value.length == 0) { addLog('warn', '发布 topic 为空'); return }
+		const qos = pubQos.value as MqttQos
+		client.publish({
+			topic: pubTopic.value,
+			payload: pubPayload.value,
+			qos,
+			retain: pubRetain.value,
+			success: () => { addLog('success', 'publish 成功 ' + pubTopic.value) },
+			fail: (err) => { addLog('fail', 'publish 失败 ' + err.errCode + ' ' + err.errMsg) },
+			complete: (_r) => {}
+		})
+	}
+
+	// ============ 自动测试 ============
+	let testRunning = false
+	let watchdog: number | null = null
+	let pendingEcho: EchoExpect | null = null
+	let testClient = createMqttClient()
+
+	function record(name: string, ok: boolean, detail: string): void {
+		testResults.value.push({ name, ok, detail })
+	}
+
+	function armWatchdog(name: string, ms: number): void {
+		if (watchdog != null) clearTimeout(watchdog!)
+		watchdog = setTimeout(() => {
+			record(name, false, '超时 ' + ms + 'ms')
+			finishTest()
+		}, ms)
+	}
+
+	function clearWatchdog(): void {
+		if (watchdog != null) {
+			clearTimeout(watchdog!)
+			watchdog = null
+		}
+	}
+
+	function finishTest(): void {
+		clearWatchdog()
+		testRunning = false
+		pendingEcho = null
+		try { testClient.destroy() } catch (_e) {}
+		addLog('test', '自动测试结束，共 ' + testResults.value.length + ' 项')
+	}
+
+	testClient.onMessage((msg) => {
+		if (pendingEcho == null) return
+		const exp = pendingEcho!
+		if (msg.topic != exp.topic) return
+		let matched = false
+		if (exp.useBase64) {
+			matched = msg.payloadBase64 == exp.payload
+		} else {
+			matched = msg.payload == exp.payload
+		}
+		record(exp.name, matched,
+			exp.useBase64 ? msg.payloadBase64 : msg.payload)
+		pendingEcho = null
+		clearWatchdog()
+		if (exp.useBase64) stepReconnectStateCheck()
+		else stepBinaryEcho()
+	})
+
+	function startAutoTest(): void {
+		if (testRunning) return
+		testRunning = true
+		testResults.value = []
+		pendingEcho = null
+		try { testClient.destroy() } catch (_e) {}
+		try {
+			testClient = createMqttClient()
+			// onMessage 监听使用固定 testClient 变量，重新赋值后需重绑
+			testClient.onMessage((msg) => {
+				if (pendingEcho == null) return
+				const exp = pendingEcho!
+				if (msg.topic != exp.topic) return
+				let matched = false
+				if (exp.useBase64) {
+					matched = msg.payloadBase64 == exp.payload
+				} else {
+					matched = msg.payload == exp.payload
+				}
+				record(exp.name, matched,
+					exp.useBase64 ? msg.payloadBase64 : msg.payload)
+				pendingEcho = null
+				clearWatchdog()
+				if (exp.useBase64) stepReconnectStateCheck()
+				else stepBinaryEcho()
+			})
+			record('创建客户端', true, 'createMqttClient OK')
+			stepConnect()
+		} catch (e) {
+			record('创建客户端', false, (e as Error).message ?? String(e))
+			finishTest()
+		}
+	}
+
+	function stepConnect(): void {
+		armWatchdog(autoConnectLabel, 12000)
+		testClient.connect({
+			url: autoUrl,
+			success: (_res) => {
+				clearWatchdog()
+				record(autoConnectLabel, true, 'connect success')
+				stepSubQos1()
+			},
+			fail: (err) => {
+				clearWatchdog()
+				record(autoConnectLabel, false,
+					err.errCode + ' ' + err.errMsg)
+				finishTest()
+			},
+			complete: (_r) => {}
+		})
+	}
+
+	const testTopicBase = 'seal/auto/' + Date.now()
+
+	function stepSubQos1(): void {
+		armWatchdog('订阅 QoS1', 8000)
+		testClient.subscribe({
+			subscriptions: [{ topic: testTopicBase + '/1', qos: 1 }],
+			success: (res) => {
+				clearWatchdog()
+				const g = res.grantedQos.length > 0 ? res.grantedQos[0] : -1
+				record('订阅 QoS1', g == 1, 'granted=' + g)
+				stepSubQos2()
+			},
+			fail: (err) => {
+				clearWatchdog()
+				record('订阅 QoS1', false, err.errCode + ' ' + err.errMsg)
+				finishTest()
+			},
+			complete: (_r) => {}
+		})
+	}
+
+	function stepSubQos2(): void {
+		armWatchdog('订阅 QoS2', 8000)
+		testClient.subscribe({
+			subscriptions: [{ topic: testTopicBase + '/2', qos: 2 }],
+			success: (res) => {
+				clearWatchdog()
+				const g = res.grantedQos.length > 0 ? res.grantedQos[0] : -1
+				record('订阅 QoS2', g == 2, 'granted=' + g)
+				stepPubQos0()
+			},
+			fail: (err) => {
+				clearWatchdog()
+				record('订阅 QoS2', false, err.errCode + ' ' + err.errMsg)
+				finishTest()
+			},
+			complete: (_r) => {}
+		})
+	}
+
+	function stepPubQos0(): void {
+		testClient.publish({
+			topic: testTopicBase + '/0',
+			payload: 'qos0-msg',
+			qos: 0,
+			success: () => { record('发布 QoS0', true, 'success 回调') ; stepTextEcho() },
+			fail: (err) => {
+				record('发布 QoS0', false, err.errCode + ' ' + err.errMsg)
+				finishTest()
+			},
+			complete: (_r) => {}
+		})
+	}
+
+	function stepTextEcho(): void {
+		const text = 'echo-中文-EmQX-' + Date.now()
+		pendingEcho = {
+			topic: testTopicBase + '/1', payload: text,
+			useBase64: false, name: 'QoS1 UTF-8 收发回环'
+		}
+		armWatchdog('QoS1 UTF-8 收发回环', 8000)
+		testClient.publish({
+			topic: testTopicBase + '/1',
+			payload: text,
+			qos: 1,
+			success: () => {},
+			fail: (err) => {
+				clearWatchdog()
+				record('QoS1 UTF-8 收发回环', false, 'publish 失败 ' + err.errCode)
+				finishTest()
+			},
+			complete: (_r) => {}
+		})
+	}
+
+	function stepBinaryEcho(): void {
+		// 字节 0..10 的 Base64
+		const b64 = 'AAECAwQFBgcICQoL'
+		pendingEcho = {
+			topic: testTopicBase + '/2', payload: b64,
+			useBase64: true, name: 'QoS2 二进制(Base64)收发回环'
+		}
+		armWatchdog('QoS2 二进制(Base64)收发回环', 8000)
+		testClient.publish({
+			topic: testTopicBase + '/2',
+			payloadBase64: b64,
+			qos: 2,
+			success: () => {},
+			fail: (err) => {
+				clearWatchdog()
+				record('QoS2 二进制(Base64)收发回环', false, 'publish 失败 ' + err.errCode)
+				finishTest()
+			},
+			complete: (_r) => {}
+		})
+	}
+
+	function stepReconnectStateCheck(): void {
+		// 已连接状态再次 connect → 必须 9010001
+		testClient.connect({
+			url: autoUrl,
+			success: (_res) => {
+				record('重复 connect 被拒', false, '竟然成功了')
+				stepDisconnect()
+			},
+			fail: (err) => {
+				record('重复 connect 被拒', err.errCode == 9010001,
+					'errCode=' + err.errCode)
+				stepDisconnect()
+			},
+			complete: (_r) => {}
+		})
+	}
+
+	function stepDisconnect(): void {
+		testClient.disconnect({
+			success: () => {
+				record('主动断开', true, 'disconnect success')
+				stepInvalidUrl()
+			},
+			fail: (err) => {
+				record('主动断开', false, err.errCode + ' ' + err.errMsg)
+				finishTest()
+			},
+			complete: (_r) => {}
+		})
+	}
+
+	function stepInvalidUrl(): void {
+		testClient.connect({
+			url: 'not-a-valid-url',
+			success: (_res) => {
+				record('非法 URL 被拒', false, '竟然成功了')
+				stepNotConnectedSub()
+			},
+			fail: (err) => {
+				record('非法 URL 被拒', err.errCode == 9010001,
+					'errCode=' + err.errCode)
+				stepNotConnectedSub()
+			},
+			complete: (_r) => {}
+		})
+	}
+
+	function stepNotConnectedSub(): void {
+		testClient.subscribe({
+			subscriptions: [{ topic: testTopicBase + '/x', qos: 0 }],
+			success: (_res) => {
+				record('未连接订阅被拒', false, '竟然成功了')
+				finishTest()
+			},
+			fail: (err) => {
+				record('未连接订阅被拒', err.errCode == 9010007,
+					'errCode=' + err.errCode)
+				finishTest()
+			},
+			complete: (_r) => {}
+		})
+	}
+</script>
+
+<style>
+	.page { flex: 1; background-color: #f2f3f7; }
+	.card { background-color: #ffffff; margin: 8px; padding: 10px; border-radius: 8px; }
+	.h { font-size: 15px; font-weight: bold; color: #222222; margin-bottom: 6px; }
+	.kv { flex-direction: row; align-items: center; flex-wrap: wrap; }
+	.k { font-size: 13px; color: #555555; }
+	.v { font-size: 13px; color: #333333; margin-left: 4px; }
+	.caps { font-size: 12px; color: #888888; margin-top: 4px; }
+	.inp { border-width: 1px; border-color: #dddddd; border-style: solid; border-radius: 6px;
+		font-size: 13px; padding: 6px; margin-top: 6px; height: 36px; }
+	.seg { flex-direction: row; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+	.rowline { flex-direction: row; align-items: center; margin-top: 6px; }
+	.grow { flex: 1; font-size: 13px; color: #333333; }
+	.detail { font-size: 12px; color: #999999; }
+	.msgline { margin-top: 6px; padding: 4px; background-color: #f7f8fa; border-radius: 4px; }
+	.msgmeta { font-size: 11px; color: #666666; }
+	.msgbody { font-size: 13px; color: #111111; }
+	.logline { margin-top: 4px; }
+	.logmeta { font-size: 11px; color: #888888; }
+	.logtext { font-size: 11px; color: #444444; }
+	.st-ok { color: #1aad19; font-size: 13px; font-weight: bold; }
+	.st-no { color: #e64340; font-size: 13px; font-weight: bold; }
+</style>
